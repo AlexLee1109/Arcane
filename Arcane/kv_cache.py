@@ -1,34 +1,19 @@
-import torch
+from typing import List, Optional
 
 class KVCache:
-    def __init__(self, n_layer, max_seq_len, n_kv_head, head_dim, device, dtype=torch.bfloat16):
-        self.n_layer = n_layer
-        self.max_seq_len = max_seq_len
-        self.n_kv_head = n_kv_head
-        self.head_dim = head_dim
-        self.device = device
-        self.dtype = dtype
-        self.cache = [None] * n_layer
-        self.current_pos = 0
+    def __init__(self, n_layers: int):
+        self.n_layers = n_layers
+        self.caches: List[Optional[dict]] = [None] * n_layers
 
-    def insert_kv(self, layer_idx, k, v):
-        B, _, T, _ = k.shape
-        if self.cache[layer_idx] is None:
-            k_cache = torch.zeros(B, self.n_kv_head, self.max_seq_len, self.head_dim, device=self.device, dtype=self.dtype)
-            v_cache = torch.zeros(B, self.n_kv_head, self.max_seq_len, self.head_dim, device=self.device, dtype=self.dtype)
-            self.cache[layer_idx] = (k_cache, v_cache)
-        k_cache, v_cache = self.cache[layer_idx]
-        k_cache[:, :, self.current_pos:self.current_pos + T, :] = k
-        v_cache[:, :, self.current_pos:self.current_pos + T, :] = v
-        self.current_pos += T
-        return k_cache[:, :, :self.current_pos, :], v_cache[:, :, :self.current_pos, :]
+    def get(self, layer_idx: int) -> Optional[dict]:
+        return self.caches[layer_idx]
 
-    def get_pos(self):
-        return self.current_pos
-
-    def update_pos(self, num_new_tokens):
-        self.current_pos += num_new_tokens
+    def update(self, layer_idx: int, cache: dict):
+        self.caches[layer_idx] = cache
 
     def reset(self):
-        self.cache = [None] * self.n_layer
-        self.current_pos = 0
+        """Clear all cached keys/values (e.g. for new conversation)"""
+        self.caches = [None] * self.n_layers
+
+    def is_empty(self) -> bool:
+        return all(c is None for c in self.caches)
