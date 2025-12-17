@@ -153,17 +153,26 @@ class GPT(nn.Module):
         return self.lm_head(self.transformer.ln_f(x))
 
     @torch.inference_mode()
-    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, eos_tokens=None, min_tokens=0, kv_cache=None):
+    def generate(
+        self,
+        tokens,
+        max_tokens,
+        temperature=1.0,
+        top_k=None,
+        eos_tokens=None,
+        min_tokens=0,
+        kv_cache=None,
+    ):
         device = next(self.parameters()).device
         input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
         kv_cache = kv_cache or KVCache(self.config.n_layer)
 
-        # Prefill full prompt into the cache
+        # Prefill prompt into KV cache
         if input_ids.shape[1] > 0:
             self(input_ids, kv_cache)
 
-        generated: List[int] = []
         eos_set = {eos_tokens} if isinstance(eos_tokens, int) else set(eos_tokens or [])
+        generated_count = 0
 
         for _ in range(max_tokens):
             logits = self(input_ids[:, -1:], kv_cache)[:, -1]
@@ -175,17 +184,20 @@ class GPT(nn.Module):
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits = logits.masked_fill(logits < v[:, -1:], float("-inf"))
 
-            next_token = torch.multinomial(F.softmax(logits, dim=-1), 1).item()
-            generated.append(next_token)
+            next_token = torch.multinomial(
+                torch.softmax(logits, dim=-1), 1
+            ).item()
 
+            generated_count += 1
+            yield next_token
+
+            # Append token for next-step conditioning
             input_ids = torch.cat(
                 [input_ids, torch.tensor([[next_token]], device=device)], dim=1
             )
 
-            if eos_set and next_token in eos_set and len(generated) >= min_tokens:
+            if eos_set and next_token in eos_set and generated_count >= min_tokens:
                 break
-
-        return generated
 
     def configure_optimizers(self, weight_decay, learning_rate):
         decay, no_decay = [], []
