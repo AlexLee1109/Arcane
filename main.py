@@ -1,133 +1,131 @@
-import sys
-from collections import defaultdict
-
+import time
 import torch
 import tiktoken
-from tqdm import tqdm
 
 from Arcane.gpt import GPT, GPTConfig
-from Benchmarks.mmlu import MMLU
-from Benchmarks.hellaswag import iterate_examples, render_example, get_most_likely_row
 
-# ----------------------------
-# Configuration & Device Setup
-# ----------------------------
-CONFIG = GPTConfig(n_layer=28, n_head=18, n_embd=1152)
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+CONFIG = GPTConfig(n_layer=24, n_head=16, n_kv_head=4, n_embd=1344)
 
-CHECKPOINT_PATH = "models/arcane.pt"
+CHECKPOINT_PATH = "models/arcane2.pt"
+
 MAX_TOKENS = 100
-TEMPERATURE = 0.6
-TOP_K = 50
+TEMPERATURE = 0.9
+TOP_K = 40
+TYPING_DELAY = 0.015
 
-# ----------------------------
-# Model Initialization
-# ----------------------------
-model = GPT(CONFIG).to(DEVICE)
-model.eval()
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
-try:
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE, weights_only=True)
-    model.load_state_dict(checkpoint["model"])
-    print(f"Loaded checkpoint from {CHECKPOINT_PATH}")
-except FileNotFoundError:
-    print(f"No checkpoint found at {CHECKPOINT_PATH}, using initialized model")
 
-model = torch.compile(model, mode="default")
-tokenizer = tiktoken.get_encoding("gpt2")
+def load_model(device: torch.device) -> GPT:
+    model = GPT(CONFIG).to(device).eval()
 
-# HellaSwag Evaluation
-def evaluate_hellaswag():
-    num_correct = 0
-    num_total = 0
+    try:
+        print(f"Loading checkpoint: {CHECKPOINT_PATH}")
+        checkpoint = torch.load(
+            CHECKPOINT_PATH,
+            map_location=device,
+            weights_only=True,
+        )
+        model.load_state_dict(checkpoint["model"])
+        print("Checkpoint loaded.")
+    except Exception as e:
+        print(f"Checkpoint load failed: {e}")
+        print("Using randomly initialized weights.")
 
-    for example in iterate_examples("val"):
-        _, tokens, mask, label = render_example(example)
-        tokens, mask = tokens.to(DEVICE), mask.to(DEVICE)
+    if device.type in {"cuda", "mps"}:
+        print("Compiling model...")
+        model = torch.compile(model, dynamic=False)
 
-        with torch.no_grad(), torch.autocast(device_type="mps", dtype=torch.bfloat16):
-            logits, _ = model(tokens)
-            pred = get_most_likely_row(tokens, mask, logits)
+    return model
 
-        num_total += 1
-        num_correct += int(pred == label)
-
-        print(f"\rAccuracy: {num_correct}/{num_total} = {num_correct/num_total:.4f}", end="", flush=True)
-
-    print(f"\nHellaSwag accuracy: {num_correct}/{num_total} = {num_correct/num_total:.4f}")
-
-# MMLU Evaluation
-def evaluate_mmlu():
-    task = MMLU(subset="all", split="test")
-    LETTERS = ("A", "B", "C", "D")
-    letter_ids = torch.tensor([tokenizer.encode(l)[0] for l in LETTERS], device=DEVICE)
+class SinonChat:
+    def __init__(self, model, tokenizer, device):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
 
     @torch.inference_mode()
-    def predict_letter(prompt: str) -> str:
-        """Generate one token and return the first valid A/B/C/D answer."""
-        tokens = tokenizer.encode(prompt, allowed_special={"<|endoftext|>"})
-        for token_id in model.generate(tokens, max_tokens=1, temperature=0.0, top_k=None):
-            if token_id in letter_ids:
-                return LETTERS[(letter_ids == token_id).nonzero(as_tuple=True)[0].item()]
-        return "A"  # fallback
+    def stream_generate(self, prompt):
+        """
+        Generate text and yield characters incrementally
+        (token-level generation, character-level display).
+        """
+        enc = self.tokenizer
 
-    correct, total = 0, 0
-    per_subject = defaultdict(lambda: [0, 0])  # [correct, total]
+        tokens = enc.encode(prompt, allowed_special={"<|endoftext|>"})
+        tokens = tokens[-CONFIG.block_size:]
 
-    for i in tqdm(range(task.num_examples()), dynamic_ncols=True):
-        convo = task.get_example(i)
-        user_prompt = convo["messages"][0]["content"]
-        gold_answer = convo["messages"][1]["content"]
-        subject = convo["subject"]
+        eos_token = enc.encode(".")[0]
 
-        pred = predict_letter(user_prompt)
-        total += 1
-        per_subject[subject][1] += 1
+        token_ids = self.model.generate(
+            tokens=tokens,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+            top_k=TOP_K,
+            eos_tokens=eos_token,
+            min_tokens=int(MAX_TOKENS * 0.8),
+            kv_cache=None,
+        )
 
-        if pred == gold_answer:
-            correct += 1
-            per_subject[subject][0] += 1
+        for token_id in token_ids:
+            text = enc.decode([token_id])
+            text = text.replace("�", "'")
 
-    overall_acc = 100 * correct / total
-    print(f"\n=== MMLU RESULTS (test split) ===")
-    print(f"Overall Accuracy: {overall_acc:.2f}%\n")
-    print("Per-Subject Accuracy:")
-    for subject, (c, t) in sorted(per_subject.items()):
-        print(f"{subject:35s}: {100*c/t:.2f}%")
+            for ch in text:
+                yield ch
 
-# Chatbot Response Generation
-def generate_responses(prompt: str):
-    """Generate text using the model with streaming output."""
-    tokens = tokenizer.encode(prompt, allowed_special={"<|endoftext|>"})
-    try:
-        for token_id in model.generate(tokens, max_tokens=MAX_TOKENS, temperature=TEMPERATURE, top_k=TOP_K):
-            print(tokenizer.decode([token_id]), end="", flush=True)
-        print()  # newline after response
-    except Exception as e:
-        print(f"Error generating response: {e}")
+    def run(self) -> None:
+        print("=== Sinon Chatbot ===")
+        print("Type 'quit' to exit.\n")
+
+        while True:
+            try:
+                prompt = input("You: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nGoodbye!")
+                return
+
+            if not prompt:
+                continue
+            if prompt.lower() in {"quit", "exit", "q"}:
+                print("Goodbye!")
+                return
+
+            print("Sinon:", end=" ", flush=True)
+
+            start = time.time()
+            chars = 0
+            first_char = True
+
+            for ch in self.stream_generate(prompt):
+                if first_char and ch.isspace():
+                    continue
+                first_char = False
+
+                print(ch, end="", flush=True)
+                chars += 1
+                time.sleep(max(0.001, TYPING_DELAY))
+
+            elapsed = time.time() - start
+            speed = chars / elapsed if elapsed > 0 else 0.0
+
+            print()
+            print(f"({speed:.1f} chars/sec • {elapsed:.2f}s)\n")
+
+def main() -> None:
+    device = get_device()
+    print(f"Using device: {device}")
+
+    model = load_model(device)
+    tokenizer = tiktoken.get_encoding("gpt2")
+
+    SinonChat(model, tokenizer, device).run()
+
 
 if __name__ == "__main__":
-    if "-eval" in sys.argv:
-        while True:
-            print("\nSelect evaluation dataset:")
-            print("1. MMLU")
-            print("q. Quit")
-            choice = input("Enter choice: ").strip().lower()
-
-            if choice in ["q", "quit", "exit"]:
-                print("Exiting evaluation mode.")
-                break
-            elif choice == "1":
-                print("Running MMLU evaluation...\n")
-                evaluate_mmlu()
-                break
-            else:
-                print("Invalid choice. Please enter 1 or q.")
-    else:
-        print("==== Sinon Chatbot ====\n")
-        while True:
-            prompt = input("User: ").strip()
-            if prompt.lower() in ["exit", "quit", "q"]:
-                print("Exiting chatbot mode.")
-                break
-            generate_responses(prompt)
+    main()
